@@ -102,6 +102,42 @@ python3 blutter.py <dir-with-libapp.so> <outdir>
 `python3 blutter.py` 只在二进制不存在时才重新编译；改过源码后需要手动
 `ninja -C blutter/build && cmake --install blutter/build`，否则会跑到旧二进制。
 
+### 内存：真正的拦路虎
+
+**必须在足够内存的机器上跑。** blutter 会把**每个函数**的反汇编文本
+（`AsmText`，约 92–104 B/条）和 IL **全部常驻内存**，直到 `DumpCode()` 才消费：
+
+```cpp
+// CodeAnalyzer.cpp:12 AnalyzeAll() —— 串行循环，无任何流式落盘
+dartFn->SetAnalyzedData(std::make_unique<AnalyzedFnData>(app, *dartFn, convertAsm(asm_insns)));
+```
+
+几十万个函数 × 每条几十~几百个 `AsmText` = 上千万条对象，仅 asmTexts 就数 GB。
+实测某 Flutter AOT 应用（44 MB APK）：
+
+| 阶段 | RSS |
+| --- | --- |
+| VM 引导 + 类表 dump | ~500 MB |
+| 反汇编分析中 | 4.5 GB → 6.5 GB 持续爬升 |
+| 触碰 **8 GiB cgroup 上限** | 卡死（`D` 状态，0% CPU，I/O 阻塞） |
+
+在 **8 GiB 容器里这个应用跑不完**，不是补丁的问题，是上游架构的固定内存模型。
+建议 **≥16 GB** 内存，或按下面的分片方式跑。
+
+### 分片（可选，缓解内存）
+
+补丁给 `AnalyzeAll()` 加了 `BLUTTER_SHARD="i/N"`：只分析函数列表的第 i/N 片。
+
+```bash
+for i in $(seq 0 7); do
+  BLUTTER_SHARD="$i/8" ./blutter_dartvm3.13.2_android_arm64 -i libapp.so -o out_$i &
+done
+wait
+```
+
+每个分片内存约 1/N。**注意**：分片输出的是**各自的残缺结果**，
+`pp.txt` / `asm/` / Frida / IDA 脚本都只含本片函数，需要自己按函数名合并。
+
 ## 验证进展
 
 以大师兄影视 `libapp.so`（Dart 3.13.2）实测：
@@ -109,10 +145,10 @@ python3 blutter.py <dir-with-libapp.so> <outdir>
 - [x] Dart VM 成功初始化并读取快照
 - [x] 类表 / 库 / 函数 / 类型全部 dump 成功
 - [x] 进入 ARM64 反汇编阶段，分析上千个函数（1650 条非致命 analysis warning）
-- [ ] 完整跑完并落盘 `pp.txt` / `asm/`
+- [ ] 完整跑完并落盘 `pp.txt` / `asm/` —— **受阻于 8 GiB 内存上限**
 
-最后阶段进程被 `SIGKILL(137)` 杀掉，疑似 OOM 或沙箱回收；补丁本身的编译期与
-VM 初始化问题已全部解决。
+补丁本身的编译期与 VM 初始化问题已全部解决；剩余阻塞是上游的内存模型，
+不属于本补丁范畴。
 
 ## 备注
 

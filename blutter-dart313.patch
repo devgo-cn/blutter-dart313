@@ -16,6 +16,75 @@ index 9751cd6..0213fdb 100644
  target_compile_definitions(${BINNAME} PRIVATE ${defines})
  
  target_compile_options(${BINNAME} PRIVATE ${cc_opts})
+diff --git a/blutter/src/CodeAnalyzer.cpp b/blutter/src/CodeAnalyzer.cpp
+index af5172e..6511629 100644
+--- a/blutter/src/CodeAnalyzer.cpp
++++ b/blutter/src/CodeAnalyzer.cpp
+@@ -13,6 +13,51 @@ void CodeAnalyzer::AnalyzeAll()
+ {
+ 	Disassembler disasmer;
+ 
++	// ---------------------------------------------------------------------
++	// Optional sharding.
++	//
++	// blutter keeps every function's analysed IL *and* its disassembly text in
++	// memory until DumpCode() runs, which blows past a constrained cgroup
++	// (e.g. an 8 GiB container) on large libapp.so files and gets the process
++	// SIGKILLed halfway through. Set BLUTTER_SHARD="i/N" to analyse only the
++	// i-th of N contiguous slices of the function list; runs are then
++	// independent and each holds ~1/N of the memory.
++	//
++	// The slice boundaries are derived from a deterministic pre-pass over the
++	// same iteration order, so every shard agrees on which function is which.
++	// ---------------------------------------------------------------------
++	int shardIndex = 0;
++	int shardCount = 1;
++	if (const char* env = std::getenv("BLUTTER_SHARD")) {
++		if (const char* slash = strchr(env, '/')) {
++			shardIndex = atoi(env);
++			shardCount = atoi(slash + 1);
++			if (shardCount < 1) shardCount = 1;
++			if (shardIndex < 0 || shardIndex >= shardCount) {
++				std::cerr << "BLUTTER_SHARD out of range, ignoring\n";
++				shardIndex = 0;
++				shardCount = 1;
++			}
++		}
++	}
++
++	// Pre-pass: assign every analysable function a global ordinal.
++	std::vector<DartFunction*> funcs;
++	if (shardCount > 1) {
++		for (auto lib : app.libs) {
++			if (lib->isInternal)
++				continue;
++			for (auto cls : lib->classes) {
++				for (auto dartFn : cls->Functions()) {
++					if (dartFn->Size() == 0)
++						continue;
++					funcs.push_back(dartFn);
++				}
++			}
++		}
++	}
++
++	uint64_t ordinal = 0;
+ 	for (auto lib : app.libs) {
+ 		if (lib->isInternal)
+ 			continue;
+@@ -21,6 +66,12 @@ void CodeAnalyzer::AnalyzeAll()
+ 				if (dartFn->Size() == 0)
+ 					continue;
+ 
++				if (shardCount > 1 && (ordinal % shardCount) != (uint64_t)shardIndex) {
++					++ordinal;
++					continue;
++				}
++				++ordinal;
++
+ 				// start from PayloadAddress or Address?
+ 				// the assemblies will be deleted after finish analysis because assembly with details consume too much memory
+ 				auto asm_insns = disasmer.Disasm((uint8_t*)dartFn->MemAddress(), dartFn->Size(), dartFn->Address());
 diff --git a/blutter/src/CodeAnalyzer_arm64.cpp b/blutter/src/CodeAnalyzer_arm64.cpp
 index c67a5b1..d828583 100644
 --- a/blutter/src/CodeAnalyzer_arm64.cpp
