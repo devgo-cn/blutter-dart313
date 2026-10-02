@@ -1,0 +1,316 @@
+diff --git a/blutter/CMakeLists.txt b/blutter/CMakeLists.txt
+index 9751cd6..0213fdb 100644
+--- a/blutter/CMakeLists.txt
++++ b/blutter/CMakeLists.txt
+@@ -107,6 +107,13 @@ endif()
+ if (UNIFORM_INTEGER_ACCESS)
+ 	set(defines ${defines} UNIFORM_INTEGER_ACCESS)
+ endif()
++# Dart >= 3.13 always exposes Mint::Value() (not Mint::value()) and requires
++# Record::GetRecordType(TypeVisibility). The two knobs above are already the
++# right behaviour for every engine we realistically target now, so default them
++# on. Override with -DUNIFORM_INTEGER_ACCESS=OFF only for very old engines.
++if (NOT DEFINED UNIFORM_INTEGER_ACCESS)
++	set(defines ${defines} UNIFORM_INTEGER_ACCESS)
++endif()
+ target_compile_definitions(${BINNAME} PRIVATE ${defines})
+ 
+ target_compile_options(${BINNAME} PRIVATE ${cc_opts})
+diff --git a/blutter/src/CodeAnalyzer_arm64.cpp b/blutter/src/CodeAnalyzer_arm64.cpp
+index c67a5b1..d828583 100644
+--- a/blutter/src/CodeAnalyzer_arm64.cpp
++++ b/blutter/src/CodeAnalyzer_arm64.cpp
+@@ -175,8 +175,12 @@ static VarValue* getPoolObject(DartApp& app, intptr_t offset, A64::Register dstR
+ 		return new VarInteger(imm, VarValue::NativeInt);
+ 	}
+ 	else if (objType == dart::ObjectPool::EntryType::kNativeFunction) {
+-		//val = pool.RawValueAt(idx);
+-		throw std::runtime_error("getting native function pool object from Dart code");
++		// A kNativeFunction entry is a bare C function pointer (used for FFI and
++		// for native entry trampolines). It is not a Dart object, so there is
++		// nothing to dereference. Emit it as a raw native address instead of
++		// aborting the whole dump - the value only ever ends up in an annotation.
++		auto imm = pool.RawValueAt(idx);
++		return new VarInteger((int64_t)imm, VarValue::NativeInt);
+ 	}
+ 	else {
+ 		throw std::runtime_error(std::format("unknown pool object type: {}", (int)objType).c_str());
+diff --git a/blutter/src/DartApp.cpp b/blutter/src/DartApp.cpp
+index 25ad347..81aea82 100644
+--- a/blutter/src/DartApp.cpp
++++ b/blutter/src/DartApp.cpp
+@@ -309,18 +309,29 @@ void DartApp::loadStubs(dart::ObjectStore* store)
+ 	ASSERT(!stubs.contains(ep_addr)); \
+ 	stubs[ep_addr] = stub;
+ 	OBJECT_STORE_STUB_CODE_LIST(DO);
+-#ifndef NO_METHOD_EXTRACTOR_STUB
++#undef DO
++
++#ifdef BLUTTER_NO_OBJECT_STORE_STUBS
++	// Dart >= 3.12 dropped OBJECT_STORE_STUB_CODE_LIST entirely. The stubs that
++	// used to live in the object store moved into the shared VM stub table, so
++	// the method-extractor pair and the throw stub are now reached via
++	// VM_STUB_CODE_LIST / StubCode:: accessors (handled below).
++	//
++	// The only extra thing we still need from here is the address of the throw
++	// stub, because the analyzer uses it to recognise rethrow/call sites.
++	throwStubAddr = dart::StubCode::Throw().EntryPoint() - base();
++#else
++	#ifndef NO_METHOD_EXTRACTOR_STUB
+ 	DO(build_nongeneric_method_extractor_code, BuildNonGenericMethodExtractor);
+ 	DO(build_generic_method_extractor_code, BuildGenericMethodExtractor);
+-#endif
+-#undef DO
+-	
++	#endif
+ 	code = store->throw_stub();
+ 	throwStubAddr = code.EntryPoint();
+ 
+ 	// load VM stub code
+ 	// the dart entry point "static void main()" is a LazyCompileVMStub which call "main" stub (a real main)
+ 	ASSERT(dart::StubCode::HasBeenInitialized());
++#endif
+ #define DO(name) {\
+ 		const auto& code = dart::StubCode::name(); \
+ 		ep_addr = code.EntryPoint() - base(); \
+diff --git a/blutter/src/DartLoader.cpp b/blutter/src/DartLoader.cpp
+index b938219..913ac65 100644
+--- a/blutter/src/DartLoader.cpp
++++ b/blutter/src/DartLoader.cpp
+@@ -25,10 +25,17 @@ static void init_dart(const uint8_t* vm_snapshot_data, const uint8_t* vm_snapsho
+ 	Dart_InitializeParams init_params;
+ 	memset(&init_params, 0, sizeof(init_params));
+ 	init_params.version = DART_INITIALIZE_PARAMS_CURRENT_VERSION;
+-	init_params.vm_snapshot_data = vm_snapshot_data;
+-	init_params.vm_snapshot_instructions = vm_snapshot_instructions;
+ 	init_params.start_kernel_isolate = false;
+ 	// other params are no needed if snapshot is not run
++#if defined(kVmSnapshotDataAsmSymbol) && !defined(kSnapshotDataAsmSymbol)
++	// Legacy engines: snapshots are handed to the VM during initialization.
++	init_params.vm_snapshot_data = vm_snapshot_data;
++	init_params.vm_snapshot_instructions = vm_snapshot_instructions;
++#endif
++	// New engines (Dart >= 3.12) dropped these fields: the single merged snapshot
++	// pair is passed to Dart_CreateIsolateGroup() instead (see load_isolate).
++	(void)vm_snapshot_data;
++	(void)vm_snapshot_instructions;
+ 	error = Dart_Initialize(&init_params);
+ 	if (error) {
+ 		throw std::runtime_error(error);
+diff --git a/blutter/src/DartStub.h b/blutter/src/DartStub.h
+index f932cbc..ecb0ff9 100644
+--- a/blutter/src/DartStub.h
++++ b/blutter/src/DartStub.h
+@@ -6,6 +6,14 @@
+ // forward declaration
+ class DartAbstractType;
+ 
++// Dart >= 3.12 removed OBJECT_STORE_STUB_CODE_LIST from stub_code_list.h: those
++// stubs are no longer stored in the object store. Provide an empty stand-in so
++// the enum stays buildable on both old and new engines.
++#ifndef OBJECT_STORE_STUB_CODE_LIST
++#define OBJECT_STORE_STUB_CODE_LIST(DO)
++#define BLUTTER_NO_OBJECT_STORE_STUBS 1
++#endif
++
+ class DartStub : public DartFnBase
+ {
+ public:
+@@ -22,6 +30,29 @@ public:
+ 		AllocateUserObjectStub,
+ 		TypeCheckStub,
+ 		UnknownStub,
++
++		// ------------------------------------------------------------------
++		// Compatibility aliases for Dart >= 3.12.
++		//
++		// VM_STUB_CODE_LIST members are emitted above with the `VMStub` suffix
++		// (e.g. DefaultTypeTest -> DefaultTypeTestVMStub), but plenty of code
++		// (notably CodeAnalyzer_arm64.cpp) was written against the pre-3.12
++		// spelling that had no `VM` infix. Older engines generated both
++		// OBJECT_STORE_STUB_CODE_LIST and VM_STUB_CODE_LIST entries, so the
++		// bare names existed. Re-expose them as plain-integer aliases so the
++		// comparisons keep compiling and keep the same numeric identity.
++		// ------------------------------------------------------------------
++		AllocateMintSharedWithFPURegsStub = AllocateMintSharedWithFPURegsVMStub,
++		AllocateMintSharedWithoutFPURegsStub = AllocateMintSharedWithoutFPURegsVMStub,
++		ArrayWriteBarrierStub = ArrayWriteBarrierVMStub,
++		DefaultTypeTestStub = DefaultTypeTestVMStub,
++		DefaultNullableTypeTestStub = DefaultNullableTypeTestVMStub,
++		InitAsyncStub = InitAsyncVMStub,
++		InitLateStaticFieldStub = InitLateStaticFieldVMStub,
++		InitLateFinalStaticFieldStub = InitLateFinalStaticFieldVMStub,
++		LateInitializationErrorSharedWithFPURegsStub = LateInitializationErrorSharedWithFPURegsVMStub,
++		LateInitializationErrorSharedWithoutFPURegsStub = LateInitializationErrorSharedWithoutFPURegsVMStub,
++		WriteBarrierWrappersStub = WriteBarrierWrappersVMStub,
+ 	};
+ 
+ 	DartStub(const dart::CodePtr ptr, Kind kind, uint64_t addr, int64_t size, std::string name) :
+diff --git a/blutter/src/DartTypes.cpp b/blutter/src/DartTypes.cpp
+index 9482811..e634e7a 100644
+--- a/blutter/src/DartTypes.cpp
++++ b/blutter/src/DartTypes.cpp
+@@ -326,8 +326,15 @@ DartAbstractType* DartTypeDb::FindOrAdd(dart::AbstractTypePtr abTypePtr)
+ 	case dart::kFunctionTypeCid:
+ 		return FindOrAdd(dart::FunctionType::RawCast(abTypePtr));
+ 	}
+-	//return nullptr;
+-	FATAL("Invalid abstract type");
++	// return nullptr;
++	// Dart >= 3.13 can hand us abstract types the switch above does not model.
++	// Aborting the whole dump for one exotic type is not worth it: report which
++	// class id we hit and fall back to `dynamic` so the dump continues.
++	{
++		const auto cid = abTypePtr.GetClassId();
++		printf("unknown abstract type cid: %d\n", (int)cid);
++		return FindOrAdd(dart::Type::DynamicType());
++	}
+ }
+ 
+ const DartTypeArguments* DartTypeDb::FindOrAdd(dart::TypeArgumentsPtr typeArgsPtr)
+diff --git a/blutter/src/ElfHelper.cpp b/blutter/src/ElfHelper.cpp
+index 030c0a2..bdbe58c 100644
+--- a/blutter/src/ElfHelper.cpp
++++ b/blutter/src/ElfHelper.cpp
+@@ -86,8 +86,8 @@ LibAppInfo ElfHelper::findSnapshots(const uint8_t* elf)
+ 			// we want only .dynstr for .dynsym
+ 			const char* strtab = (const char*)elf + section->file_offset;
+ 			const char* last = strtab + section->file_size;
+-			const char* s_first = kVmSnapshotDataAsmSymbol;
+-			const char* s_last = s_first + strlen(kVmSnapshotDataAsmSymbol) + 1;
++			const char* s_first = kSnapshotDataAsmSymbol;
++			const char* s_last = s_first + strlen(kSnapshotDataAsmSymbol) + 1;
+ 			//if (memmem(strtab, section->s_size, kVmSnapshotDataAsmSymbol, strlen(kVmSnapshotDataAsmSymbol))) {
+ 			if (std::search(strtab, last, s_first, s_last) != last) {
+ 				// found it
+@@ -105,18 +105,25 @@ LibAppInfo ElfHelper::findSnapshots(const uint8_t* elf)
+ 	}
+ 
+ 	// find the required symbol addresses
++	// NOTE: Dart >= 3.12 (new naming) merges the VM and isolate snapshots into a
++	// single pair: _kDartSnapshotData (data) + _kDartSnapshotText (instructions).
++	// Older engines used four separate symbols. Support both layouts.
+ 	const uint8_t* vm_snapshot_data = nullptr;
+ 	const uint8_t* vm_snapshot_instructions = nullptr;
+ 	const uint8_t* isolate_snapshot_data = nullptr;
+ 	const uint8_t* isolate_snapshot_instructions = nullptr;
++	bool has_legacy_snapshot = false;
+ 	for (; dynsym < dynsym_end; dynsym++) {
+ 		if (dynsym->info == 0)
+ 			continue;
+ 
+ 		const char* name = dynstr + dynsym->name;
+ 		// Note: sym_size is no needed for dart VM (its blob contains size)
++		// Legacy engines (Dart < 3.12) exported four separate snapshot symbols.
++#if defined(kVmSnapshotDataAsmSymbol) && !defined(kSnapshotDataAsmSymbol)
+ 		if (strcmp(name, kVmSnapshotDataAsmSymbol) == 0) {
+ 			vm_snapshot_data = elf + dynsym->value;
++			has_legacy_snapshot = true;
+ 		}
+ 		else if (strcmp(name, kVmSnapshotInstructionsAsmSymbol) == 0) {
+ 			vm_snapshot_instructions = elf + dynsym->value;
+@@ -127,7 +134,19 @@ LibAppInfo ElfHelper::findSnapshots(const uint8_t* elf)
+ 		else if (strcmp(name, kIsolateSnapshotInstructionsAsmSymbol) == 0) {
+ 			isolate_snapshot_instructions = elf + dynsym->value;
+ 		}
++#else
++		// New engines (Dart >= 3.12): one data + one text blob shared by VM and isolate.
++		if (strcmp(name, kSnapshotDataAsmSymbol) == 0) {
++			vm_snapshot_data = elf + dynsym->value;
++			isolate_snapshot_data = elf + dynsym->value;
++		}
++		else if (strcmp(name, kSnapshotTextAsmSymbol) == 0) {
++			vm_snapshot_instructions = elf + dynsym->value;
++			isolate_snapshot_instructions = elf + dynsym->value;
++		}
++#endif
+ 	}
++	(void)has_legacy_snapshot;
+ 
+ 	if (vm_snapshot_data == nullptr)
+ 		throw std::invalid_argument("ELF: Cannot find Dart VM Snapshot Data");
+diff --git a/blutter/src/pch.h b/blutter/src/pch.h
+index 6fe72e9..f552dd4 100644
+--- a/blutter/src/pch.h
++++ b/blutter/src/pch.h
+@@ -112,4 +112,34 @@ namespace dart {
+ #  define DartGetRecordType(record) record.GetRecordType()
+ #endif
+ 
++// ---------------------------------------------------------------------------
++// Dart >= 3.13 closure layout
++// ---------------------------------------------------------------------------
++// UntaggedClosure used to declare named fields for the trailing variable-length
++// data (delayed_type_arguments / context / ...), so the generated offsets header
++// exported AOT_Closure_context_offset and
++// AOT_Closure_delayed_type_arguments_offset as *fixed* offsets.
++//
++// In newer engines the trailing data is a single variable-length array starting
++// at AOT_Closure_elements_start_offset, and the meaning of each slot depends on
++// the closure's flags (raw_object.h -> UntaggedClosure::ContextIndex()):
++//
++//   data[0] = delayed type arguments   (present iff has_delayed_type_args)
++//   data[1] = instantiator type args   (present iff class is generic)
++//   data[2] = function type arguments
++//   ...     = captured values / context
++//
++// The two legacy constants therefore both collapse onto "the first slot of the
++// trailing data", which is exactly AOT_Closure_elements_start_offset. For the
++// two places blutter uses them (recognising the prologue's closure-context and
++// closure-type-argument loads) that is the right address: in a closure with no
++// type arguments the context lands at data[0], and the delayed-type-arguments
++// load also targets data[0].
++#ifndef AOT_Closure_delayed_type_arguments_offset
++#  define AOT_Closure_delayed_type_arguments_offset AOT_Closure_elements_start_offset
++#endif
++#ifndef AOT_Closure_context_offset
++#  define AOT_Closure_context_offset AOT_Closure_elements_start_offset
++#endif
++
+ #endif //PCH_H
+diff --git a/extract_dart_info.py b/extract_dart_info.py
+index 60e4cf2..1b7077c 100644
+--- a/extract_dart_info.py
++++ b/extract_dart_info.py
+@@ -12,12 +12,39 @@ from elftools.elf.enums import ENUM_E_MACHINE
+ from elftools.elf.sections import SymbolTableSection
+ 
+ # TODO: support both ELF and Mach-O file
++# Newer Flutter engines (Dart >= 3.5x) renamed the snapshot symbols:
++#   old: _kDartVmSnapshotData / _kDartVmSnapshotInstructions
++#   new: _kDartSnapshotData   / _kDartSnapshotText
++SNAPSHOT_SYMBOL_NAMES = [
++    '_kDartVmSnapshotData',
++    '_kDartSnapshotData',
++]
++
++
++def find_snapshot_symbol(dynsym):
++    for name in SNAPSHOT_SYMBOL_NAMES:
++        syms = dynsym.get_symbol_by_name(name)
++        if syms:
++            return syms[0]
++    # Fallback: any global OBJECT symbol holding a large snapshot blob
++    for sym in dynsym.iter_symbols():
++        if sym['st_info']['type'] == 'STT_OBJECT' and sym['st_size'] > 128 \
++                and 'Snapshot' in sym.name:
++            return sym
++    return None
++
++
+ def extract_snapshot_hash_flags(libapp_file):
+     with open(libapp_file, 'rb') as f:
+         elf = ELFFile(f)
+-        # find "_kDartVmSnapshotData" symbol
++        # find the Dart snapshot data symbol (old or new naming)
+         dynsym = elf.get_section_by_name('.dynsym')
+-        sym = dynsym.get_symbol_by_name('_kDartVmSnapshotData')[0]
++        sym = find_snapshot_symbol(dynsym)
++        if sym is None:
++            names = [s.name for s in dynsym.iter_symbols()]
++            raise RuntimeError(
++                'No Dart snapshot symbol found in .dynsym. Available: ' + ', '.join(names))
++        print('using snapshot symbol:', sym.name, hex(sym['st_value']), sym['st_size'])
+         #section = elf.get_section(sym['st_shndx'])
+         assert sym['st_size'] > 128
+         f.seek(sym['st_value']+20)
